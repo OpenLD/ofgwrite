@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 
 // search device table for specific partition names
@@ -14,15 +15,41 @@ int search_via_part_names(char* device_table)
 	char* pos;
 
 	// Search for rootfs and kernel partitions. Both have to be on the same device.
-	if (strstr(device_table, "(kernel)") != NULL && strstr(device_table, "(rootfs)") != NULL)
+	if (strstr(device_table, "(kernel)") != NULL && strstr(device_table, "(dreambox-rootfs)") != NULL)
+	{
+		strcpy(cmp_kernel_name, "(kernel)");
+		strcpy(cmp_rootfs_name, "(dreambox-rootfs)");
+	}
+	else if (strstr(device_table, "(kernel)") != NULL && strstr(device_table, "(rootfs)") != NULL)
 	{
 		strcpy(cmp_kernel_name, "(kernel)");
 		strcpy(cmp_rootfs_name, "(rootfs)");
+	}
+	else if (strstr(device_table, "(ekernel)") != NULL && strstr(device_table, "(rootfs)") != NULL)
+	{
+		strcpy(cmp_kernel_name, "(ekernel)");
+		strcpy(cmp_rootfs_name, "(rootfs)");
+	}
+	else if (strstr(device_table, "(exkernel)") != NULL && strstr(device_table, "(exrootfs)") != NULL)
+	{
+		strcpy(cmp_kernel_name, "(exkernel)");
+		strcpy(cmp_rootfs_name, "(exrootfs)");
+	}
+	else if (strstr(device_table, "(boot)") != NULL && strstr(device_table, "(root)") != NULL)
+	{
+		strcpy(cmp_kernel_name, "(boot)");
+		strcpy(cmp_rootfs_name, "(root)");
 	}
 	else if (strstr(device_table, "(linuxkernel)") != NULL && strstr(device_table, "(linuxrootfs)") != NULL)
 	{
 		strcpy(cmp_kernel_name, "(linuxkernel)");
 		strcpy(cmp_rootfs_name, "(linuxrootfs)");
+	}
+	else if ( access( "/dev/block/by-name/flag", F_OK) != -1 && current_rootfs_sub_dir[0] != '\0')
+	{
+		sprintf(cmp_kernel_name, "(linuxkernel%d)", multiboot_partition);
+		strcpy(cmp_rootfs_name, "(rootfs)");
+		sprintf(rootfs_sub_dir, "linuxrootfs%d", multiboot_partition);
 	}
 	else if (current_rootfs_sub_dir[0] != '\0') // box with rootSubDir feature
 	{

@@ -14,7 +14,29 @@
 #include <unistd.h>
 #include <errno.h>
 
-const char ofgwrite_version[] = "4.5.5";
+struct stat kernel_file_stat;
+struct stat rootfs_file_stat;
+
+char kernel_device_arg[1000];
+char rootfs_device_arg[1000];
+char kernel_device[1000];
+char rootfs_device[1000];
+char rootfs_sub_dir[1000];
+
+int found_kernel_device;
+int found_rootfs_device;
+int user_kernel;
+int user_rootfs;
+int rootsubdir_check;
+int multiboot_partition;
+char current_rootfs_device[1000];
+char current_kernel_device[1000];
+char current_rootfs_sub_dir[1000];
+char ubi_fs_name[1000];
+
+enum FlashModeTypeEnum kernel_flash_mode;
+enum FlashModeTypeEnum rootfs_flash_mode;
+
 int flash_kernel  = 0;
 int flash_rootfs  = 0;
 int no_write      = 0;
@@ -27,6 +49,9 @@ char rootfs_filename[1000];
 char rootfs_mount_point[1000];
 enum RootfsTypeEnum rootfs_type;
 int stop_e2_needed = 1;
+
+const char ofgwrite_version[] = "4.6.2";
+
 struct struct_mountlist
 {
 	char* dir;
@@ -163,6 +188,7 @@ int read_args(int argc, char *argv[])
 	multiboot_partition = -1;
 	user_kernel = 0;
 	user_rootfs = 0;
+	rootsubdir_check = 0;
 
 	while ((opt= getopt_long(argc, argv, short_options, long_options, &option_index)) != -1)
 	{
@@ -198,10 +224,15 @@ int read_args(int argc, char *argv[])
 				break;
 			case 'm':
 				if (optarg)
-					if (strlen(optarg) == 1 && ((int)optarg[0] >= 48) && ((int)optarg[0] <= 57))
+					if (strlen(optarg) == 1 && ((int)optarg[0] >= 49) && ((int)optarg[0] <= 57))
 					{
 						multiboot_partition = strtol(optarg, NULL, 10);
 						my_printf("Flashing multiboot partition %d\n", multiboot_partition);
+					}
+					else if (strlen(optarg) == 1 && ((int)optarg[0] == 48))
+					{
+						my_printf("Flashing without rootSubDir check \n");
+						rootsubdir_check = 1;
 					}
 					else
 					{
@@ -317,7 +348,8 @@ int read_mtd_file()
 				{
 					if ((strcmp(name, "\"kernel\"") == 0
 						|| strcmp(name, "\"nkernel\"") == 0
-						|| strcmp(name, "\"kernel2\"") == 0))
+						|| strcmp(name, "\"kernel2\"") == 0
+						|| strcmp(name, "\"boot\"") == 0))
 					{
 						if (kernel_filename[0] != '\0')
 							my_printf("  ->  %s <- User selected!!\n", kernel_filename);
@@ -346,8 +378,10 @@ int read_mtd_file()
 				if (rootfs_file_stat.st_size <= devsize
 					&& strcmp(esize, "0001f000") != 0)
 				{
-					if (strcmp(name, "\"rootfs\"") == 0
-						|| strcmp(name, "\"rootfs2\"") == 0)
+					if ((strcmp(name, "\"rootfs\"") == 0
+						|| strcmp(name, "\"rootfs2\"") == 0
+						|| strcmp(name, "\"dreambox-rootfs\"") == 0
+						|| strcmp(name, "\"root\"") == 0))
 					{
 						if (rootfs_filename[0] != '\0')
 							my_printf("  ->  %s <- User selected!!\n", rootfs_filename);
@@ -376,7 +410,10 @@ int read_mtd_file()
 			// auto kernel
 			else if (!user_kernel
 					&& (strcmp(name, "\"kernel\"") == 0
-						|| strcmp(name, "\"nkernel\"") == 0))
+						|| strcmp(name, "\"nkernel\"") == 0
+						|| (strcmp(name, "\"boot\"") == 0 && multiboot_partition == -1)
+						|| (strcmp(name, "\"linuxkernel1\"") == 0 && multiboot_partition == 1)
+						|| (strcmp(name, "\"linuxkernel2\"") == 0 && multiboot_partition == 2)))
 			{
 				if (found_kernel_device)
 				{
@@ -398,7 +435,11 @@ int read_mtd_file()
 					my_printf("  <-  Error: Kernel file is bigger than device size!!\n");
 			}
 			// auto rootfs
-			else if (!user_rootfs && strcmp(name, "\"rootfs\"") == 0)
+			else if (!user_rootfs 
+					&& (strcmp(name, "\"rootfs\"") == 0
+						|| strcmp(name, "\"dreambox-rootfs\"") == 0
+						|| strcmp(name, "\"root\"") == 0
+						|| (strcmp(name, "\"userdata\"") == 0 && multiboot_partition != -1)))
 			{
 				if (found_rootfs_device)
 				{
@@ -417,7 +458,13 @@ int read_mtd_file()
 					else
 						my_printf("\n");
 					found_rootfs_device = 1;
-					rootfs_flash_mode = MTD;
+					if (strcmp(name, "\"userdata\"") == 0) // box with subdir feature in mtd partition e.g. sfx6008
+					{
+						rootfs_flash_mode = TARBZ2_MTD;
+						sprintf(rootfs_sub_dir, "linuxrootfs%d", multiboot_partition);
+					}
+					else
+						rootfs_flash_mode = MTD;
 				}
 				else if (strcmp(esize, "0001f000") == 0)
 					my_printf("  <-  Error: Invalid erasesize\n");
@@ -453,8 +500,11 @@ int kernel_flash(char* device, char* filename)
 
 int rootfs_flash(char* device, char* filename)
 {
-	if (rootfs_flash_mode == TARBZ2)
-		return flash_ext4_rootfs(filename, quiet, no_write);
+	if (rootfs_flash_mode == TARBZ2 || rootfs_flash_mode == TARBZ2_MTD)
+	{
+		my_printf("Flash rootfs unpack\n");
+		return flash_unpack_rootfs(filename, quiet, no_write);
+	}
 	else if (rootfs_flash_mode == MTD)
 	{
 		if (rootfs_type == EXT4) // MTD rootfs with unknown format -> expect ubifs as only ubifs boxes support this
@@ -501,12 +551,13 @@ int readProcMounts()
 	while ((mountEntry = getmntent(f)) != NULL)
 	{
 		// detect rootfs type
-		if (strstr(mountEntry->mnt_fsname, "rootfs") != NULL
+		if ((strstr(mountEntry->mnt_fsname, "rootfs") != NULL || strstr(mountEntry->mnt_fsname, "ubifs") != NULL)
 		 && strcmp(mountEntry->mnt_dir, "/") == 0
 		 && strcmp(mountEntry->mnt_type, "ubifs") == 0)
 		{
 			my_printf("Found UBIFS rootfs\n");
 			rootfs_type = UBIFS;
+			strncpy(ubi_fs_name, mountEntry->mnt_fsname, 1000);
 		}
 		else if (strstr(mountEntry->mnt_fsname, "root") != NULL
 			  && strcmp(mountEntry->mnt_dir, "/") == 0
@@ -934,9 +985,12 @@ int umount_rootfs(int steps)
 		my_printf("umount not successful\n");
 
 	// mount oldroot to other mountpoint, because otherwise all data in not moved filesystems under /oldroot will be deleted
-	if (rootfs_flash_mode == TARBZ2)
+	if (rootfs_flash_mode == TARBZ2 || rootfs_flash_mode == TARBZ2_MTD)
 	{
-		ret = mount(rootfs_device, "/oldroot_remount/", "ext4", 0, NULL);
+		if (rootfs_flash_mode == TARBZ2)
+			ret = mount(rootfs_device, "/oldroot_remount/", "ext4", 0, NULL);
+		else
+			ret = mount(ubi_fs_name, "/oldroot_remount/", "ubifs", 0, NULL);
 		if (!ret)
 			my_printf("remount to /oldroot_remount/ successful\n");
 		else
@@ -949,7 +1003,7 @@ int umount_rootfs(int steps)
 			return 0;
 		}
 	}
-	else if (ret && rootfs_flash_mode != TARBZ2) // umount failed -> remount read only
+	else if (ret && rootfs_flash_mode != TARBZ2 && rootfs_flash_mode != TARBZ2_MTD) // umount failed -> remount read only
 	{
 		ret = mount("/oldroot/", "/oldroot/", "", MS_REMOUNT | MS_RDONLY, NULL);
 		if (ret)
@@ -1096,7 +1150,7 @@ void find_kernel_rootfs_device()
 	}
 	if (user_rootfs)
 	{
-		if (current_rootfs_sub_dir[0] != '\0' && multiboot_partition == -1) // box with rootSubDir feature
+		if (current_rootfs_sub_dir[0] != '\0' && multiboot_partition == -1 && rootsubdir_check == 0) // box with rootSubDir feature
 		{
 			found_rootfs_device = 0;
 			my_printf("Error: In case of rootSubDir multiboot with user defined rootfs -m parameter is mandatory\n", rootfs_device);
@@ -1107,13 +1161,13 @@ void find_kernel_rootfs_device()
 		rootfs_flash_mode = TARBZ2;
 		sprintf(rootfs_device, "/dev/%s", rootfs_device_arg);
 		my_printf("Using %s as rootfs device\n", rootfs_device);
-		if (current_rootfs_sub_dir[0] != '\0')
+		if (current_rootfs_sub_dir[0] != '\0' && rootsubdir_check == 0)
 		{
 			sprintf(rootfs_sub_dir, "linuxrootfs%d", multiboot_partition);
 		}
 	}
 
-	if  (((current_rootfs_sub_dir[0] == '\0' && strcmp(rootfs_device, current_rootfs_device) != 0) ||
+	if  (((current_rootfs_sub_dir[0] == '\0' && strcmp(rootfs_device, current_rootfs_device) != 0 && rootfs_flash_mode != MTD) ||
 		  ( current_rootfs_sub_dir[0] != '\0' && strcmp(current_rootfs_sub_dir, rootfs_sub_dir) != 0 )
 		 ) && !force_e2_stop
 		)
@@ -1210,6 +1264,7 @@ int main(int argc, char *argv[])
 	found_rootfs_device = 0;
 	kernel_flash_mode = FLASH_MODE_UNKNOWN;
 	rootfs_flash_mode = FLASH_MODE_UNKNOWN;
+	ubi_fs_name[0] = '\0';
 
 	ret = read_args(argc, argv);
 
@@ -1226,8 +1281,7 @@ int main(int argc, char *argv[])
 	// find kernel and rootfs devices
 	my_printf("\n");
 	read_mtd_file();
-	if (!found_kernel_device || !found_rootfs_device)
-		find_kernel_rootfs_device();
+	find_kernel_rootfs_device();
 
 	if (flash_kernel && (!found_kernel_device || kernel_filename[0] == '\0'))
 	{
@@ -1300,9 +1354,9 @@ int main(int argc, char *argv[])
 		}
 
 		int steps = 6;
-		if (flash_kernel && rootfs_flash_mode != TARBZ2)
+		if (flash_kernel && rootfs_flash_mode != TARBZ2 && rootfs_flash_mode != TARBZ2_MTD)
 			steps+= 2;
-		else if (flash_kernel && rootfs_flash_mode == TARBZ2)
+		else if (flash_kernel && (rootfs_flash_mode == TARBZ2 || rootfs_flash_mode == TARBZ2_MTD))
 			steps+= 1;
 		init_framebuffer(steps);
 		show_main_window(0, ofgwrite_version);
@@ -1361,15 +1415,19 @@ int main(int argc, char *argv[])
 			}
 		}
 		// if not running rootfs is flashed then we need to mount it before start flashing
-		if (!no_write && !stop_e2_needed && rootfs_flash_mode == TARBZ2)
+		if (!no_write && !stop_e2_needed && (rootfs_flash_mode == TARBZ2 || rootfs_flash_mode == TARBZ2_MTD))
 		{
 			set_step("Mount rootfs");
+			my_printf("Mount rootfs\n");
 			mkdir("/oldroot_remount", 777);
 			// mount rootfs device
-			ret = mount(rootfs_device, "/oldroot_remount/", "ext4", 0, NULL);
+			if (rootfs_flash_mode == TARBZ2_MTD) // box with mtd subdir feature e.g. sfx6008
+				ret = mount(ubi_fs_name, "/oldroot_remount/", "ubifs", 0, NULL);
+			else
+				ret = mount(rootfs_device, "/oldroot_remount/", "ext4", 0, NULL);
 			if (!ret)
 				my_printf("Mount to /oldroot_remount/ successful\n");
-			else if (errno == EINVAL)
+			else if (errno == EINVAL && rootfs_flash_mode != TARBZ2_MTD)
 			{
 				// most likely partition is not formatted -> format it
 				char mkfs_cmd[100];
@@ -1443,7 +1501,10 @@ int main(int argc, char *argv[])
 			set_step("Successfully flashed!");
 		}
 		else
+		{
+			ret = umount("/oldroot_remount/");
 			set_step("Successfully flashed! Rebooting in 3 seconds");
+		}
 		fflush(stdout);
 		fflush(stderr);
 		sleep(3);
